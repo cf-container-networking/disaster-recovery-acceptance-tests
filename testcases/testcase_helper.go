@@ -4,7 +4,8 @@ import "github.com/cloudfoundry-incubator/disaster-recovery-acceptance-tests/run
 
 func OpenSourceTestCases() []runner.TestCase {
 	return []runner.TestCase{
-		NewAppUptimeTestCase(),
-		NewCfAppTestCase(),
+		// NewAppUptimeTestCase(),
+		// NewCfAppTestCase(),
+		NewCfNetworkingTestCase(),
 	}
 }
