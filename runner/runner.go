@@ -2,98 +2,187 @@ package runner
 
 import (
 	"fmt"
-
 	"time"
 
-	. "github.com/cloudfoundry-incubator/disaster-recovery-acceptance-tests/common"
+	"os"
+
+	"io/ioutil"
+	"path"
+
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gexec"
 )
 
-func RunDisasterRecoveryAcceptanceTests(configGetter ConfigGetter, testCases []TestCase) {
+func RunDisasterRecoveryAcceptanceTests(config Config, testCases []TestCase) {
 	var uniqueTestID string
 	var testContext *TestContext
-	var config Config
+	var backupRunning bool
+	var cfHomeTmpDir string
+	var err error
 
 	BeforeEach(func() {
-		config = configGetter.FindConfig()
+		fmt.Println("Running testcases:")
+		for _, testCase := range testCases {
+			fmt.Println(testCase.Name())
+		}
 
-		SetDefaultEventuallyTimeout(30 * time.Minute)
+		backupRunning = false
+
+		SetDefaultEventuallyTimeout(config.Timeout)
+
 		uniqueTestID = RandomStringNumber()
-		testContext = NewTestContext(uniqueTestID, config.BoshConfig)
+		testContext, err = NewTestContext(uniqueTestID, config.BoshConfig)
+		Expect(err).NotTo(HaveOccurred())
+
+		cfHomeTmpDir, err = ioutil.TempDir("", "drats-cf-home")
+		Expect(err).NotTo(HaveOccurred())
+
+		for _, testCase := range testCases {
+			err := os.Mkdir(cfHomeDir(cfHomeTmpDir, testCase), 0700)
+			Expect(err).NotTo(HaveOccurred())
+		}
 	})
 
 	It("backups and restores a cf", func() {
-		if config.DeploymentToBackup.Name != config.DeploymentToRestore.Name {
-			printDeploymentsAreDifferentWarning()
-		}
-
-		// ### populate state in environment to be backed up
+		By("populating state in environment to be backed up")
 		for _, testCase := range testCases {
+			os.Setenv("CF_HOME", cfHomeDir(cfHomeTmpDir, testCase))
+			By("running the BeforeBackup step for " + testCase.Name())
 			testCase.BeforeBackup(config)
 		}
 
-		By("backing up " + config.DeploymentToBackup.Name)
-		Eventually(RunCommandSuccessfully(fmt.Sprintf(
-			"cd %s && %s deployment --target %s --ca-cert %s --username %s --password %s --deployment %s backup",
-			testContext.WorkspaceDir,
-			testContext.BinaryPath,
-			config.BoshConfig.BoshURL,
-			testContext.CertificatePath,
-			config.BoshConfig.BoshClient,
-			config.BoshConfig.BoshClientSecret,
-			config.DeploymentToBackup.Name,
-		))).Should(gexec.Exit(0))
+		backupRunning = true
+		By("backing up " + config.CloudFoundryConfig.Name)
+		RunCommandSuccessfullyWithFailureMessage(
+			"bbr deployment backup",
+			fmt.Sprintf(
+				"cd %s && %s deployment --target %s --ca-cert %s --username %s --password %s --deployment %s backup",
+				testContext.WorkspaceDir,
+				testContext.BinaryPath,
+				config.BoshConfig.BoshURL,
+				testContext.CertificatePath,
+				config.BoshConfig.BoshClient,
+				config.BoshConfig.BoshClientSecret,
+				config.CloudFoundryConfig.Name,
+			))
+		backupRunning = false
 
-		Eventually(StatusCode(config.DeploymentToBackup.ApiUrl)).Should(Equal(200))
+		Eventually(StatusCode(config.CloudFoundryConfig.ApiUrl), 5*time.Minute).Should(Equal(200))
 
 		for _, testCase := range testCases {
+			By("running the AfterBackup step for " + testCase.Name())
+			os.Setenv("CF_HOME", cfHomeDir(cfHomeTmpDir, testCase))
 			testCase.AfterBackup(config)
 		}
 
-		By("restoring to " + config.DeploymentToRestore.Name)
-		Eventually(RunCommandSuccessfully(fmt.Sprintf(
-			"cd %s && %s deployment --target %s --ca-cert %s --username %s --password %s "+
-				"--deployment %s restore --artifact-path $(ls %s | grep %s | head -n 1)",
-			testContext.WorkspaceDir,
-			testContext.BinaryPath,
-			config.BoshConfig.BoshURL,
-			testContext.CertificatePath,
-			config.BoshConfig.BoshClient,
-			config.BoshConfig.BoshClientSecret,
-			config.DeploymentToRestore.Name,
-			testContext.WorkspaceDir,
-			config.DeploymentToBackup.Name,
-		))).Should(gexec.Exit(0))
+		if config.DeleteAndRedeployCF {
+			By("deleting the deployment")
+			manifestSession := RunCommandSuccessfully("bosh-cli",
+				"-e", config.BoshURL,
+				"--ca-cert", testContext.CertificatePath,
+				"--client", config.BoshConfig.BoshClient,
+				"--client-secret", config.BoshConfig.BoshClientSecret,
+				"-d", config.CloudFoundryConfig.Name,
+				"manifest",
+			)
+			file, err := ioutil.TempFile("", "cf")
+			Expect(err).NotTo(HaveOccurred())
+			_, err = file.Write(manifestSession.Out.Contents())
+			Expect(err).NotTo(HaveOccurred())
 
-		// ### check state in restored environment
+			RunCommandSuccessfully("bosh-cli", "-n",
+				"-e", config.BoshURL,
+				"--ca-cert", testContext.CertificatePath,
+				"--client", config.BoshConfig.BoshClient,
+				"--client-secret", config.BoshConfig.BoshClientSecret,
+				"-d", config.CloudFoundryConfig.Name,
+				"delete-deployment",
+			)
+
+			RunCommandSuccessfully("bosh-cli", "-n",
+				"-e", config.BoshURL,
+				"--ca-cert", testContext.CertificatePath,
+				"--client", config.BoshConfig.BoshClient,
+				"--client-secret", config.BoshConfig.BoshClientSecret,
+				"-d", config.CloudFoundryConfig.Name,
+				"deploy", file.Name(),
+			)
+		}
+
+		By("restoring to " + config.CloudFoundryConfig.Name)
+		RunCommandSuccessfullyWithFailureMessage(
+			"bbr deployment restore",
+			fmt.Sprintf(
+				"cd %s && %s deployment --target %s --ca-cert %s --username %s --password %s "+
+					"--deployment %s restore --artifact-path $(ls %s | grep %s | head -n 1)",
+				testContext.WorkspaceDir,
+				testContext.BinaryPath,
+				config.BoshConfig.BoshURL,
+				testContext.CertificatePath,
+				config.BoshConfig.BoshClient,
+				config.BoshConfig.BoshClientSecret,
+				config.CloudFoundryConfig.Name,
+				testContext.WorkspaceDir,
+				config.CloudFoundryConfig.Name,
+			))
+
+		By("checking state in restored environment")
 		for _, testCase := range testCases {
+			By("running the AfterRestore step for " + testCase.Name())
+			os.Setenv("CF_HOME", cfHomeDir(cfHomeTmpDir, testCase))
 			testCase.AfterRestore(config)
 		}
 	})
 
 	AfterEach(func() {
-		//TODO: Can we delete this?
+		var backupCleanupSession, artifactCleanupSession *gexec.Session
+		var removeHomeDirErr error
+		if backupRunning {
+			By("running bbr backup-cleanup")
+			backupCleanupSession = RunCommandWithFailureMessage(
+				"bbr deployment backup-cleanup",
+				fmt.Sprintf(
+					"cd %s && %s deployment --target %s --ca-cert %s --username %s --password %s --deployment %s backup-cleanup",
+					testContext.WorkspaceDir,
+					testContext.BinaryPath,
+					config.BoshConfig.BoshURL,
+					testContext.CertificatePath,
+					config.BoshConfig.BoshClient,
+					config.BoshConfig.BoshClientSecret,
+					config.CloudFoundryConfig.Name,
+				))
+		}
 		By("cleaning up the artifact")
-		Eventually(RunCommandSuccessfully(fmt.Sprintf("cd %s && rm -fr %s",
+		artifactCleanupSession = RunCommand(fmt.Sprintf("cd %s && rm -fr %s",
 			testContext.WorkspaceDir,
-			config.DeploymentToRestore.Name,
-		))).Should(gexec.Exit(0))
+			config.CloudFoundryConfig.Name,
+		))
 
-		// ### clean up backup environment
 		for _, testCase := range testCases {
+			By("running the Cleanup step for " + testCase.Name())
+			os.Setenv("CF_HOME", cfHomeDir(cfHomeTmpDir, testCase))
 			testCase.Cleanup(config)
 		}
 
+		By("removing individual test-case cf-home directory")
+		for _, testCase := range testCases {
+			removeHomeDirErr = os.RemoveAll(cfHomeDir(cfHomeTmpDir, testCase))
+		}
+
+		By("cleaning up the test context")
 		testContext.Cleanup()
+
+		if backupRunning {
+			Expect(backupCleanupSession).To(gexec.Exit(0))
+		}
+
+		Expect(artifactCleanupSession).To(gexec.Exit(0))
+		Expect(removeHomeDirErr).ToNot(HaveOccurred())
+
 	})
 }
 
-func printDeploymentsAreDifferentWarning() {
-	fmt.Println("     --------------------------------------------------------")
-	fmt.Println("     NOTE: this suite is currently configured to back up from")
-	fmt.Println("     one deployment and restore to a different one. Make     ")
-	fmt.Println("     sure this is the intended configuration.                ")
-	fmt.Println("     --------------------------------------------------------")
+func cfHomeDir(root string, testCase TestCase) string {
+	return path.Join(root, testCase.Name()+"-cf-home")
 }

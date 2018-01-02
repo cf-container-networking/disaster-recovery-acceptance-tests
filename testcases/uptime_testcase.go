@@ -6,25 +6,33 @@ import (
 	"path"
 	"time"
 
-	. "github.com/cloudfoundry-incubator/disaster-recovery-acceptance-tests/common"
+	. "github.com/cloudfoundry-incubator/disaster-recovery-acceptance-tests/runner"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
+
+const CURL_ERROR_FOR_404 = 22
 
 type AppUptimeTestCase struct {
 	uniqueTestID            string
 	stopCheckingAppAlive    chan<- bool
 	stopCheckingAPIGoesDown chan<- bool
 	valueApiWasDown         <-chan bool
+	name                    string
 }
 
 func NewAppUptimeTestCase() *AppUptimeTestCase {
 	id := RandomStringNumber()
-	return &AppUptimeTestCase{uniqueTestID: id}
+	return &AppUptimeTestCase{uniqueTestID: id, name: "app-uptime"}
+}
+
+func (tc *AppUptimeTestCase) Name() string {
+	return tc.name
 }
 
 func (tc *AppUptimeTestCase) BeforeBackup(config Config) {
-	RunCommandSuccessfully("cf login --skip-ssl-validation -a", config.DeploymentToBackup.ApiUrl, "-u", config.DeploymentToBackup.AdminUsername, "-p", config.DeploymentToBackup.AdminPassword)
+	RunCommandSuccessfully("cf api --skip-ssl-validation", config.CloudFoundryConfig.ApiUrl)
+	RunCommandSuccessfully("cf auth", config.CloudFoundryConfig.AdminUsername, config.CloudFoundryConfig.AdminPassword)
 	RunCommandSuccessfully("cf create-org acceptance-test-org-" + tc.uniqueTestID)
 	RunCommandSuccessfully("cf create-space acceptance-test-space-" + tc.uniqueTestID + " -o acceptance-test-org-" + tc.uniqueTestID)
 	RunCommandSuccessfully("cf target -o acceptance-test-org-" + tc.uniqueTestID + " -s acceptance-test-space-" + tc.uniqueTestID)
@@ -34,7 +42,7 @@ func (tc *AppUptimeTestCase) BeforeBackup(config Config) {
 	By("checking the app stays up")
 	appUrl := GetAppUrl("test_app_" + tc.uniqueTestID)
 	tc.stopCheckingAppAlive = checkAppRemainsAlive(appUrl)
-	tc.stopCheckingAPIGoesDown, tc.valueApiWasDown = checkApiGoesDown()
+	tc.stopCheckingAPIGoesDown, tc.valueApiWasDown = checkApiGoesDown(config.CloudFoundryConfig.ApiUrl)
 }
 
 func (tc *AppUptimeTestCase) AfterBackup(config Config) {
@@ -44,7 +52,7 @@ func (tc *AppUptimeTestCase) AfterBackup(config Config) {
 	log.Println("writing to stopCheckingAPIGoesDown...")
 	tc.stopCheckingAPIGoesDown <- true
 	log.Println("reading from valueApiWasDown...")
-	Expect(<-tc.valueApiWasDown).To(BeTrue(), "expected api to have been down, but it")
+	Expect(<-tc.valueApiWasDown).To(BeTrue(), "expected api to be down, but it isn't")
 }
 
 func (tc *AppUptimeTestCase) AfterRestore(config Config) {
@@ -53,13 +61,10 @@ func (tc *AppUptimeTestCase) AfterRestore(config Config) {
 
 func (tc *AppUptimeTestCase) Cleanup(config Config) {
 	By("cleaning up orgs, spaces and apps")
-	RunCommandSuccessfully("cf login --skip-ssl-validation -a", config.DeploymentToBackup.ApiUrl, "-u", config.DeploymentToBackup.AdminUsername, "-p", config.DeploymentToBackup.AdminPassword)
-	RunCommandSuccessfully("cf target -o acceptance-test-org-" + tc.uniqueTestID)
-	RunCommandSuccessfully("cf delete-space -f acceptance-test-space-" + tc.uniqueTestID)
 	RunCommandSuccessfully("cf delete-org -f acceptance-test-org-" + tc.uniqueTestID)
 }
 
-func checkApiGoesDown() (chan<- bool, <-chan bool) {
+func checkApiGoesDown(apiUrl string) (chan<- bool, <-chan bool) {
 	doneChannel := make(chan bool)
 	valueApiWasDown := make(chan bool)
 	ticker := time.NewTicker(1 * time.Second)
@@ -74,7 +79,7 @@ func checkApiGoesDown() (chan<- bool, <-chan bool) {
 				valueApiWasDown <- apiWasDown
 				return
 			case <-tickerChannel:
-				if RunCommand("cf orgs").ExitCode() == 1 {
+				if RunCommand("curl", "-k", "--fail", apiUrl, " 2>/dev/null > /dev/null").ExitCode() == CURL_ERROR_FOR_404 {
 					apiWasDown = true
 					ticker.Stop()
 				}

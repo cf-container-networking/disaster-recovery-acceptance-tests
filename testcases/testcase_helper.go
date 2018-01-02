@@ -1,11 +1,17 @@
 package testcases
 
-import "github.com/cloudfoundry-incubator/disaster-recovery-acceptance-tests/runner"
+import (
+	"github.com/cloudfoundry-incubator/disaster-recovery-acceptance-tests/runner"
+)
 
 func OpenSourceTestCases() []runner.TestCase {
 	return []runner.TestCase{
-		// NewAppUptimeTestCase(),
-		// NewCfAppTestCase(),
+		NewRouterGroupTestCase(),
+		NewAppUptimeTestCase(),
+		NewCfAppTestCase(),
+		NewCfUaaTestCase(),
 		NewCfNetworkingTestCase(),
+		NewNFSTestCases(),
+		NewCfCredhubSSITestCase(),
 	}
 }
